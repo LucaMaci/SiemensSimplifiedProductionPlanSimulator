@@ -155,6 +155,7 @@ class DiscreteFittedQ(QFunction):
         return self._regressors[action].predict(states)
     
     def values(self, sa):
+        
         if not np.shape(sa)[1] == self._state_dim + 1:
             raise AttributeError("An Nx(S+1) matrix must be provided")
         
@@ -193,10 +194,16 @@ class DiscreteFittedQ(QFunction):
         return max_vals, max_actions
     
     def fit(self, sa, q, **fit_params):
+        print(sa)
+        print(len(sa))
+        print(sa[:, -1])
+        print(len(sa[:, -1]))
         params = dict(fit_params)
         
         for a in self._actions:
             mask = sa[:,-1] == a
+            print(mask)
+            print(len(mask))
             if "sample_weight" in fit_params:
                 w = fit_params["sample_weight"]
                 w = w[mask]

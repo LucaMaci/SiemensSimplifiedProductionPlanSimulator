@@ -1,16 +1,38 @@
 import numpy as np
-from utils.graphs_utils import DistQAndLPIPlotter, FQIPlotter
+import random
+import json
 
-model_path_runs = {}
-model_path_runs[0] = 'models/20_units_increased_difficulty_1_product/reward5/True_True_25_True_500_False_IAP500/FQI/FQI_10.0_0_30_3_1_1_0.2ProvaMultipleEpsilon/run0'
-model_path_runs[1] = 'models/20_units_increased_difficulty_1_product/reward5/True_True_25_True_500_False_IAP500/FQI/FQI_10.0_0_30_3_1_1_0.2ProvaMultipleEpsilon/run1'
-model_path_runs[2] = 'models/20_units_increased_difficulty_1_product/reward5/True_True_25_True_500_False_IAP500/FQI/FQI_10.0_0_30_3_1_1_0.2ProvaMultipleEpsilon/run2'
-model_path_runs[3] = 'models/20_units_increased_difficulty_1_product/reward5/True_True_25_True_500_False_IAP500/FQI/FQI_10.0_0_30_3_1_1_0.2ProvaMultipleEpsilon/run3'
-model_path_runs[4] = 'models/20_units_increased_difficulty_1_product/reward5/True_True_25_True_500_False_IAP500/FQI/FQI_10.0_0_30_3_1_1_0.2ProvaMultipleEpsilon/run4'
-multiple_exploration_probabilities = True
-exploration_probabilities = [0.01, 0.1, 0.2, 0.5]
-episodes_for_each_explor_for_iteration = 5
-test_episodes_for_fqi_iteration = 21
+import math
 
-plotter = FQIPlotter(model_path_runs, test_episodes_for_fqi_iteration, multiple_exploration_probabilities, exploration_probabilities, episodes_for_each_explor_for_iteration)
-plotter.plot_performance_graph_multiple_epsilon()
+import numpy as np
+
+agents_skills_custom_duration = {
+    "1": {"1": 16},
+    "2": {"1": 8},
+    "3": {"2": 10},
+    "4": {"2": 5},
+    "5": {"7": 13}
+}
+
+new_agents_skills_custom_duration = {
+    int(outer_key): {
+        int(inner_key): value 
+        for inner_key, value in inner_dict.items()
+    } 
+    for outer_key, inner_dict in agents_skills_custom_duration.items()
+}
+
+
+print(new_agents_skills_custom_duration)
+
+current_agent = 5
+action = 8
+
+if current_agent in new_agents_skills_custom_duration and action in new_agents_skills_custom_duration[current_agent]:
+    action_time = new_agents_skills_custom_duration[current_agent][action]
+else:
+    action_time = 10000
+
+print(action_time)
+
+

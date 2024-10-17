@@ -84,7 +84,9 @@ class EpsilonGreedy(ValueBased):
             #return np.array([self._actions[np.random.choice(self._n_actions)]])
         else:
             # added to debug
+            print(f'probabilities of the policy: {self._q_values(state)}')
             masked_q_values = [q_value for q_value, m in zip(self._q_values(state), mask) if m == 1]
+            print(f'probabilities of the masked policy: {masked_q_values}')
             return np.array([masked_actions[np.argmax(masked_q_values)]])
             #return np.array([self._actions[np.argmax(self._q_values(state))]])
         

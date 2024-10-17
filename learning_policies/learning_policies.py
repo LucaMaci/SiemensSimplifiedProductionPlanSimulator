@@ -9,9 +9,8 @@ import json
 import os
 
 class LearningAgent:
-    def __init__(self, config, model_units_folder, run_num, agent_num, n_training_episodes, reward_type, available_actions, agents_connections):
+    def __init__(self, config, model_units_folder, agent_num, n_training_episodes, reward_type, available_actions, agents_connections):
         self.algorithm = config['algorithm']
-        self.run_num = run_num
         self.agent_num = agent_num
         self.n_training_episodes = n_training_episodes
         self.reward_type = reward_type
@@ -53,7 +52,6 @@ class LearningAgent:
         elif config['actions_policy'] == "eps-greedy":
             # DEP = decreasing exploration probability
             self.model_name += f'_DEP'
-        self.model_name += f'/run{self.run_num}'
 
     def apply_values_update(self):
         self.values = self.values_updated
@@ -96,12 +94,6 @@ class LearningAgent:
             prob_values = policy_values / np.sum(policy_values)
             print(f'actions: {allowed_actions}, prob_values: {prob_values}')
             return np.random.choice(allowed_actions, p=prob_values)
-        
-    def get_next_agent_number(self, action):
-        action -= self.actions[0]
-        if action == 4:
-            return self.agent_num
-        return self.agents_connections[self.agent_num][action] 
     
     def save(self):
         model_agent_path = f'{self.model_name}/{self.agent_num}.json'
@@ -131,8 +123,8 @@ class LearningAgent:
         return self.gamma
 
 class DistributedQLearningAgent(LearningAgent):
-    def __init__(self, config, model_units_folder, run_num, agent_num, n_training_episodes, reward_type, available_actions, agents_connections):
-        super().__init__(config, model_units_folder, run_num, agent_num, n_training_episodes, reward_type, available_actions, agents_connections)
+    def __init__(self, config, model_units_folder, agent_num, n_training_episodes, reward_type, available_actions, agents_connections):
+        super().__init__(config, model_units_folder, agent_num, n_training_episodes, reward_type, available_actions, agents_connections)
 
     def update_values(self, observation, action, reward, agents_information):
         action = action - self.actions[0]
@@ -163,7 +155,13 @@ class DistributedQLearningAgent(LearningAgent):
                     curr_value = self.policy[state]
                     sum_curr_value = np.sum(curr_value)
                     new_value = (curr_value ** (1 - lr_policy * self.tau) / sum_curr_value) * np.exp(lr_policy * np.array(self.values[state]['Q']))
-                    self.policy[state] = np.round(new_value, 3)   
+                    self.policy[state] = np.round(new_value, 3)
+            
+    def get_next_agent_number(self, action):
+        action -= self.actions[0]
+        if action == 4:
+            return self.agent_num
+        return self.agents_connections[self.agent_num][action]    
 
     def get_random_action(self, allowed_actions):
         return np.random.choice(allowed_actions)
@@ -174,8 +172,8 @@ class DistributedQLearningAgent(LearningAgent):
         return np.max(self.values[observation]['Q'])
 
 class LPIAgent(LearningAgent):
-    def __init__(self, config, model_units_folder, run_num, agent_num, n_training_episodes, reward_type, available_actions, agents_connections):
-        super().__init__(config, model_units_folder, run_num, agent_num, n_training_episodes, reward_type, available_actions, agents_connections)
+    def __init__(self, config, model_units_folder, agent_num, n_training_episodes, reward_type, available_actions, agents_connections):
+        super().__init__(config, model_units_folder, agent_num, n_training_episodes, reward_type, available_actions, agents_connections)
 
         self.beta = config['beta']
         self.kappa = config['kappa']
@@ -189,7 +187,6 @@ class LPIAgent(LearningAgent):
         elif config['actions_policy'] == "eps-greedy":
             # DEP = decreasing exploration probability
             self.model_name += f'_DEP'
-        self.model_name += f'/run{self.run_num}'
 
     def get_n_hop_neighbours(self, n_hop):
         neighbour = set()
@@ -286,29 +283,26 @@ class LPIAgent(LearningAgent):
         return self.model_name
     
 class FQIAgent():
-    def __init__(self, config, model_units_folder, run_num, agen_num, n_training_episodes, reward_type, available_actions, agents_connections):
-        self.run_num = run_num
+    def __init__(self, config, agen_num, n_training_episodes, reward_type):
         self.agent_num = agen_num
         self.INPUT_DIR = config['INPUT_DIR']
-        self.actions = available_actions
+        self.actions = config['available_actions']
         self.algorithm = config['algorithm']
-        self.agents_connections = {int(k): v for k, v in agents_connections.items()}
+        self.agents_connections = {int(k): v for k, v in config['agents_connections'].items()}
         self.observability_grade = config['observability_grade']
         self.observable_neighbours = self.get_n_hop_neighbours(self.observability_grade)
 
         self.regressor_params = config['regressor_params']
         self.max_iterations = config['max_iterations']
         self.batch_size = config['batch_size']
+        self.n_runs = config['n_runs']
+        self.n_jobs = config['n_jobs']
         self.fit_params = config['fit_params']
         self.exploration_probability = config['exploration_probability']
 
         self.n_training_episodes = n_training_episodes
-        self.test_episodes_for_fqi_iteration = config['test_episodes_for_fqi_iteration']
         self.reward_type = reward_type
-        self.model_name = f'models/{model_units_folder}/{self.reward_type}/{self.algorithm}/{self.algorithm}_{self.n_training_episodes/self.test_episodes_for_fqi_iteration}_{self.observability_grade}_{self.regressor_params["n_estimators"]}_{self.regressor_params["min_samples_split"]}_{self.max_iterations}_{self.batch_size}_{self.exploration_probability}'
-        if config['multiple_exploration_probabilities']:
-            self.model_name += '_multipleExplorationProbabilities'
-        self.model_name += f'/run{self.run_num}'
+        self.model_name = f'models/{self.reward_type}/{self.algorithm}/{self.algorithm}_{self.n_training_episodes}'
 
         _, _, _, self.r, self.s_prime, self.absorbing, self.sa, _ = split_data_single_agent(self.INPUT_DIR, self.agent_num)
 
@@ -328,14 +322,6 @@ class FQIAgent():
     def iter(self):
         for _ in range(self.max_iterations):
             self.fqi_agent._iter(self.sa, self.r, self.s_prime, self.absorbing, **self.fit_params)
-
-    # Used to execute a greedy episode
-    def change_exploration_probability(self, epsilon):
-        self.pi.epsilon = epsilon
-
-    # Used to restore after the greedy episode
-    def restore_exploration_probability(self):
-        self.pi.epsilon = self.exploration_probability
 
     def select_action(self, observation, mask):
         # adjust mask to make it contain only actions possible for that specific agent
@@ -357,12 +343,6 @@ class FQIAgent():
             neighbour.add(self.agent_num)
 
         return list(neighbour)
-    
-    def get_next_agent_number(self, action):
-        action -= self.actions[0]
-        if action == 4:
-            return self.agent_num
-        return self.agents_connections[self.agent_num][action] 
     
     def get_model_name(self):
         return self.model_name

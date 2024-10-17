@@ -1,6 +1,5 @@
 import json
 import numpy as np
-import copy
 
 class TrajectoryManager():
     def __init__(self, INPUT_DIR, OUTPUT_DIR, config):
@@ -111,34 +110,19 @@ class TrajectoryManager():
 
     # this function allow to hide states of agents with a distance greater than observability grade for each agent
     # CAUTION: perform this before converting global trajectory into agents trajectories
-    def set_states_observability(self, restricted_neighbours_state = False):
+    def set_states_observability(self):
         observability_grade = self.config['observability_grade']
         agents_state_mask = self.compute_agents_state_mask(observability_grade)
         for episode_product in self.trajectories:
             for step in self.trajectories[episode_product]:
-                if not restricted_neighbours_state:
-                    step['state']['agents_state'] = [lst for lst, mask in zip(step['state']['agents_state'], agents_state_mask[step['agent']]) if any(x != 0 for x in mask)]
-                    products_mask = np.zeros(self.n_products)
-                    for agent_state in step['state']['agents_state']:
-                        if max(agent_state) == 1:
-                            products_mask[np.argmax(agent_state)] = 1
-                    for i in range(len(step['state']['products_state'])):
-                        if products_mask[i] == 0:
-                            step['state']['products_state'][i] = np.zeros_like(step['state']['products_state'][i]).tolist()
-                # try to make the state lighter, i.e. indicate neighbours state only with a binary list (1 if a neighbour is occupied, 0 otherwise)
-                else:
-                    agent = step['agent']
-                    step['state']['current_agent_state'] = step['state']['agents_state'][agent]
-                    step['state']['agents_state'] = [lst for lst, mask in zip(step['state']['agents_state'], agents_state_mask[step['agent']]) if any(x != 0 for x in mask)]
-                    step['state']['agents_state'] = [1 if np.max(elem) == 1 else 0 for elem in step['state']['agents_state']]
-                    products_mask = np.zeros(self.n_products)
-                    agent_state = step['state']['current_agent_state']
+                step['state']['agents_state'] = [lst for lst, mask in zip(step['state']['agents_state'], agents_state_mask[step['agent']]) if any(x != 0 for x in mask)]
+                products_mask = np.zeros(self.n_products)
+                for agent_state in step['state']['agents_state']:
                     if max(agent_state) == 1:
                         products_mask[np.argmax(agent_state)] = 1
-                    for i in range(len(step['state']['products_state'])):
-                        if products_mask[i] == 0:
-                            step['state']['products_state'][i] = np.zeros_like(step['state']['products_state'][i]).tolist()
-
+                for i in range(len(step['state']['products_state'])):
+                    if products_mask[i] == 0:
+                        step['state']['products_state'][i] = np.zeros_like(step['state']['products_state'][i]).tolist()
 
     # extract state of current agent and product skills of his product for DISTQ algorithm
     def extract_agent_state_and_product_skills_for_DISTQ(self):

@@ -13,7 +13,6 @@ If you need to run a simulation in order to train a model the first thing to do 
 * ``output_log``: this parameter can be setted as **true** or **false**. If it is **true** the output of the training (representation of the state for each step) will be saved in a **txt** file. **NOTE:** this will slow down the training process a lot. Furthermore if you set it as **true** you will need to specify a path for the output files (will be one file for each episode) in ``output_path``.
 * ``n_agents``: this parameter specify the number of agents (units) of the structure used for the simulation.
 * ``n_products``:  this parameter specify the number of products of a bach (>1 if multiproduct).
-* ``n_runs``: specifies the number of runs for the training.
 * ``n_episodes``: specifies the number of training episodes (an episode is terminated when all the **n_products** have been produced).
 * ``n_production_skills``: number of **production skills**.
 * ``actions``: list containing alla the actions. You need to consider first all the **production skills** then **transport and defer skills** and in the end one more action for **skip turn action**, used if there is nothing to do with an agent in a time instant. E.g. if whe have ``"actions": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]`` and ``"n_production_skills": 10`` it means that actions *from 0 to 9 are production skills, 10 is move up, 11 move right, 12 move down, 13 move left, 14 defer and 15 skip turn action*.

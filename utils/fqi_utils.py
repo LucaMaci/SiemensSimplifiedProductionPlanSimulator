@@ -20,16 +20,3 @@ def get_FQI_state(state, observable_neighbours, n_products):
         if products_mask[i] == 0:
             state['products_state'][i] = np.zeros_like(state['products_state'][i]).tolist()
     return flatten_dict_values(state)
-
-def get_FQI_state_reduced_neighbours_info(agent, state, observable_neighbours, n_products):
-    state['current_agent_state'] = state['agents_state'][agent]
-    state['agents_state'] = [state['agents_state'][i] for i in range(len(state['agents_state'])) if i in observable_neighbours]
-    state['agents_state'] = [1 if np.max(elem) == 1 else 0 for elem in state['agents_state']]
-    products_mask = np.zeros(n_products)
-    agent_state = state['current_agent_state']
-    if max(agent_state) == 1:
-        products_mask[np.argmax(agent_state)] = 1
-    for i in range(len(state['products_state'])):
-        if products_mask[i] == 0:
-            state['products_state'][i] = np.zeros_like(state['products_state'][i]).tolist()
-    return flatten_dict_values(state)

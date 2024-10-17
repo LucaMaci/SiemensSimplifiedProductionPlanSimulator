@@ -1,343 +1,236 @@
-from production_plant_environment.env.production_plant_environment_v0 import ProductionPlantEnvironment
-from utils.learning_policies_utils import initialize_agents, get_agent_state_and_product_skill_observation_DISTQ_online
-from utils.fqi_utils import get_FQI_state, get_FQI_state_reduced_neighbours_info
-from utils.graphs_utils import DistQAndLPIPlotter, FQIPlotter
-import json
-import numpy as np
-import copy
 import os
+import json
+import copy
+import sys
+sys.path.insert(0, 'ai_optimizer')
+import numpy as np
+from production_plant_environment.env.production_plant_environment_v0 import ProductionPlantEnvironment
+from utils.learning_policies_utils import initialize_agents
+from utils.graphs_utils import RewardVisualizer
 
-CONFIG_PATH = "config/simulator_config.json"
+
+
+CONFIG_PATH = "ai_optimizer/configs/simulator_config_3units.json"
 SEMI_MDP_CONFIG_PATH = "config/semiMDP_reward_config.json"
+LEARNING_CONFIG_PATH = "ai_optimizer/configs/learning_config.json"
+MQTT_HOST_URL = 'localhost'
 
 with open(CONFIG_PATH) as config_file:
     config = json.load(config_file)
+with open(SEMI_MDP_CONFIG_PATH) as config_file:
+    semiMDP_reward_config = json.load(config_file)
+with open(LEARNING_CONFIG_PATH) as config_file:
+    learning_config = json.load(config_file)
 
 test_model = config['test_model']
 test_model_name = config['test_model_name']
 test_model_n_episodes = config['test_model_n_episodes']
 n_agents = config['n_agents']
 n_products = config['n_products']
-n_runs = config['n_runs']
 n_episodes = config['n_episodes']
-n_training_episodes = n_episodes
 num_max_steps = config['num_max_steps']
 n_production_skills = config['n_production_skills']
+nothing_action = n_production_skills + 5
 algorithm = config['algorithm']
+export_trajectories = config['export_trajectories']
+output_log = config['output_log']
 custom_reward = config['custom_reward']
-available_actions = config['available_actions']
+supply_action = config['supply_action']
+discount_factor = config['gamma']
 baseline_path = config['baseline_path']
-greedy_step = False
+one_hot_state = config['one_hot_state']
+loop_threshold = config["loop_threshold"]
+checkpoint_frequency = config["checkpoint_frequency"]
+shaping_value = config["shaping_value"]
+agent_connections = config["agents_connections"]
+use_masking = learning_config["action_masking"]
 
-if custom_reward == 'reward5':
-    with open(SEMI_MDP_CONFIG_PATH) as config_file:
-        semiMDP_reward_config = json.load(config_file)
 
-# Dictionary of the paths of all the runs
-model_path_runs = {}
-baseline_path_runs = {}
+def get_rllib_state(state, old_state, one_hot_state=False, use_masking=False):
+    # next_skill , previous_agent, threshold_detected
+    obs_rllib = []
+    next_skill = state["products_state"][0,:, 0].tolist().index(1)
+    previous_agent = old_state["current_agent"]
+    if one_hot_state:
+        next_skill_ohe = np.zeros(n_production_skills)
+        next_skill_ohe[next_skill] = 1
+        next_skill = next_skill_ohe
+        previous_agent_ohe = np.zeros(n_agents)
+        previous_agent_ohe[previous_agent] = 1
+        previous_agent = previous_agent_ohe
+    obs_rllib.extend(next_skill)
+    obs_rllib.extend(previous_agent)
+    obs_rllib = np.array(obs_rllib).flatten().tolist()
+    if use_masking:
+        action_mask = get_action_mask(state)
+        obs_rllib = {
+            "observations": obs_rllib,
+            "action_mask": action_mask.tolist()
+        }
+    return obs_rllib
 
-for run in range(n_runs):
-    if test_model:
-        n_episodes = config['n_episodes']
-
-    if algorithm != 'random' and algorithm != 'FQI':
-        learning_agents, update_values, policy_improvement = initialize_agents(n_agents, algorithm, run, n_episodes, custom_reward, available_actions, config['agents_connections'])
-    elif algorithm == 'FQI':
-        learning_agents, test_episodes_for_fqi_iteration, multiple_exploration_probabilities, exploration_probabilities, episodes_for_each_explor_for_iteration = initialize_agents(n_agents, algorithm, run, n_episodes, custom_reward, available_actions, config['agents_connections'])
-
-    if algorithm == 'LPI':
-        observations_history_LPI = {}
-    
-    performance = {}
-    greedy_fqi_performance = {}
-   
-    if algorithm != 'random':
-        if test_model:
-            # if we are testing load existing model
-            for i in range(len(learning_agents)):
-                learning_agents[i].load(f'{test_model_name}/run{run}/{i}')
-        else:
-            # otherwise create model path
-            for agent in learning_agents:
-                agent.save()
-        model_path = learning_agents[0].get_model_name()
+def get_action_mask(state):
+    # Only works for 3 agents now
+    current_agent = state["current_agent"]
+    if current_agent == 1:
+        action_mask = np.ones(2)
+        if np.random.rand() < 0.5:
+            action_mask[np.random.choice(2)] = 0
     else:
-        model_path = baseline_path
-        model_path += f'/run{run}'
-        if not os.path.exists(model_path):
-            os.makedirs(model_path)
+        action_mask = np.ones(1)
+    return action_mask
 
-    model_path_runs[run] = model_path
-    baseline_path_runs[run] = baseline_path
-    baseline_path_runs[run] += f'/run{run}'
-    
-    env = ProductionPlantEnvironment(config, run, model_path, semiMDP_reward_config)
-    
-    if test_model:
-        n_episodes = test_model_n_episodes
+def extract_kpi(skill): # TODO remove since it is done inside the env
+    fact_duration = 0
+    fact_energy = 0
+    kpi_duration = skill["Duration"]
+    idle_energy_consumption = skill['IdleEnergyConsumption']
+    dynamic_energy_consumption = sum([behavior['DynamicEnergyConsumption']
+                                      for behavior in skill['Behaviors']])
+    kpi_energy = idle_energy_consumption + dynamic_energy_consumption
+    kpi = fact_duration * kpi_duration + fact_energy * kpi_energy
+    return kpi
 
-    if algorithm == 'FQI' and multiple_exploration_probabilities:
-        actual_expl_prob_index = 0
-        expl_prob_counter = 0
-        new_exploration_probability = exploration_probabilities[actual_expl_prob_index]
-        for fqi_agent in learning_agents:
-            fqi_agent.change_exploration_probability(new_exploration_probability)
-        print(f"Exploration probability changed to {new_exploration_probability}")
 
-    for episode in range(n_episodes):
-        if algorithm == 'DistQ' or algorithm == 'LPI':
-            for agent in learning_agents:
-                if test_model:
-                    agent.update_exploration_prob(test_model)
-                else:
-                    # update exploration probability basing on episode
-                    agent.update_exploration_prob(test_model, episode + 1)
+def shape_reward(overall_kpi, production_kpi, shaping_value=1.):
+    """
+    Shape the reward
+    - non_production_kpi: any kind of ,
+    - skills_duration: is the duration due to execution skills (it's contained in computed_duration)
+    """
+    return overall_kpi - shaping_value * production_kpi
 
-        if greedy_step:
-            greedy_step = False
-            for fqi_agent in learning_agents:
-                fqi_agent.restore_exploration_probability()
-            if multiple_exploration_probabilities:
-                actual_expl_prob_index = 0
-                expl_prob_counter = 0
-                new_exploration_probability = exploration_probabilities[actual_expl_prob_index]
-                for fqi_agent in learning_agents:
-                    fqi_agent.change_exploration_probability(new_exploration_probability)
-                print(f"Exploration probability changed to {new_exploration_probability}")
-            else:
-                print("Exploration probability restored")
-        
-        if algorithm == 'FQI' and not test_model and episode % test_episodes_for_fqi_iteration == (test_episodes_for_fqi_iteration - 1):
-            greedy_step = True
-            for fqi_agent in learning_agents:
-                fqi_agent.change_exploration_probability(0)
-            print("Exploration probability changed to 0")
 
-        if algorithm == 'FQI' and multiple_exploration_probabilities and not test_model and not greedy_step:
-            if expl_prob_counter == episodes_for_each_explor_for_iteration:
-                actual_expl_prob_index += 1
-                expl_prob_counter = 0
-                new_exploration_probability = exploration_probabilities[actual_expl_prob_index]
-                for fqi_agent in learning_agents:
-                    fqi_agent.change_exploration_probability(new_exploration_probability)
-                print(f"Exploration probability changed to {new_exploration_probability}")
-            expl_prob_counter += 1
-
-        if algorithm == 'FQI' and not test_model and episode % test_episodes_for_fqi_iteration == 0:
-            for fqi_agent in learning_agents:
-                fqi_agent.iter()
-                fqi_agent.save()
-
-        state = env.reset()
-        old_state = copy.deepcopy(state)
-        
-        for step in range(num_max_steps):
-            if algorithm == 'random':
-                # TO-DO: remove that after test or put it somewhere else
-                if n_products == 1 and config['random_eps_opt']:
-                    epsilon = config['random_eps_opt_epsilon']
-                    next_skill = [i for i in range(len(state['products_state'][0])) if 1 in state['products_state'][0][i]][0]
-                    if np.random.rand() < epsilon:
-                        actions = np.array(env.actions)
-                        actions = actions[np.array(state['action_mask'][state['current_agent']]) == 1]
-                        action = np.random.choice(actions)
-                    else:
-                        if n_agents == 9:
-                            if state['current_agent'] == 0 and next_skill == 1:
-                                action = 9
-                            elif state['current_agent'] == 1 and next_skill == 1:
-                                action = 9
-                            elif state['current_agent'] == 2 and next_skill == 2:
-                                action = 10
-                            elif state['current_agent'] == 5 and next_skill == 2:
-                                action = 10
-                            elif state['current_agent'] == 8 and next_skill == 3:
-                                action = 8
-                            elif state['current_agent'] == 5 and next_skill == 3:
-                                action = 8
-                            elif state['current_agent'] == 2 and next_skill == 3:
-                                action = 11
-                            elif state['current_agent'] == 1 and next_skill == 7:
-                                action = 11
-                            elif state['current_agent'] == 0 and next_skill == 7:
-                                action = 10
-                            elif state['current_agent'] == 5 and next_skill == 3:
-                                action = 8
-                            else:
-                                actions = np.array(env.actions)
-                                actions = actions[np.array(state['action_mask'][state['current_agent']]) == 1]
-                                action = np.random.choice(actions)
-                        elif n_agents == 20:
-                            if state['current_agent'] == 5 and next_skill == 1:
-                                action = 11
-                            elif state['current_agent'] == 6 and next_skill == 1:
-                                action = 10
-                            elif state['current_agent'] == 1 and next_skill == 2:
-                                action = 12
-                            elif state['current_agent'] == 6 and next_skill == 2:
-                                action = 11
-                            elif state['current_agent'] == 7 and next_skill == 3:
-                                action = 12
-                            elif state['current_agent'] == 12 and next_skill == 3:
-                                action = 11
-                            elif state['current_agent'] == 13 and next_skill == 3:
-                                action = 10
-                            elif state['current_agent'] == 8 and next_skill == 3:
-                                action = 10
-                            elif state['current_agent'] == 3 and next_skill == 4:
-                                action = 11
-                            elif state['current_agent'] == 4 and next_skill == 9:
-                                action = 13
-                            elif state['current_agent'] == 3 and next_skill == 9:
-                                action = 13
-                            elif state['current_agent'] == 2 and next_skill == 9:
-                                action = 13
-                            elif state['current_agent'] == 1 and next_skill == 9:
-                                action = 13
-                            else:
-                                actions = np.array(env.actions)
-                                actions = actions[np.array(state['action_mask'][state['current_agent']]) == 1]
-                                action = np.random.choice(actions)
-                else:
-                    actions = np.array(env.actions)
-                    actions = actions[np.array(state['action_mask'][state['current_agent']]) == 1]
-                    action = np.random.choice(actions)
-            elif algorithm == 'DistQ':
-                agent = learning_agents[state['current_agent']]
-                obs = get_agent_state_and_product_skill_observation_DISTQ_online(state['current_agent'], state)
-                mask = state['action_mask'][state['current_agent']][n_production_skills:-1]
-                action = agent.select_action(obs, mask)
-            elif algorithm == 'LPI':
-                agent = learning_agents[state['current_agent']]
-                obs = agent.generate_observation(state)
-                mask = state['action_mask'][state['current_agent']][n_production_skills:-1]
-                action = agent.select_action(obs, mask)
-            elif algorithm == 'FQI':
-                agent = learning_agents[state['current_agent']]
-                obs = get_FQI_state({'agents_state': state['agents_state'].copy(), 'products_state': state['products_state'].copy()}, agent.get_observable_neighbours(), n_products)
-                # used for lighter neighbours info
-                #obs = get_FQI_state_reduced_neighbours_info(state['current_agent'], {'agents_state': state['agents_state'].copy(), 'products_state': state['products_state'].copy()}, agent.get_observable_neighbours(), n_products)
-                mask = state['action_mask'][state['current_agent']][n_production_skills:-1]
-                action = agent.select_action(obs, mask)
-
-            state, reward, done, truncation, info = env.step(action)
-            old_state = copy.deepcopy(state)
-
-            if done:
-                print(f"The episode {episode+1}/{n_episodes} is finished.")
-                if custom_reward == 'reward5':
-                    trajectory_for_semi_MDP = env.get_actual_trajectory()
-                    agents_rewards_for_plot = env.get_agents_rewards_for_semiMDP()
-                break
-            elif truncation:
-                print(f"The episode {episode+1}/{n_episodes} has been truncated.")
-                if custom_reward == 'reward5':
-                    trajectory_for_semi_MDP = env.get_actual_trajectory()
-                    agents_rewards_for_plot = env.get_agents_rewards_for_semiMDP()
-                break
-        
-        # semi MDP reward postponed computation (at the end of the episode)
-        if custom_reward == 'reward5':
-            # semi MDP reward postponed update values (at the end of the episode)
-            if not test_model and custom_reward == 'reward5' and algorithm == 'DistQ':
-                for actual_step in trajectory_for_semi_MDP:
-                    if actual_step['action_selected_by_algorithm']:
-                        agent = learning_agents[actual_step['old_state']['current_agent']]
-                        action = actual_step['action']
-                        reward = actual_step['reward']
-                        next_agent_num = agent.get_next_agent_number(action)
-                        next_agent = learning_agents[next_agent_num]
-
-                        agents_informations = next_agent.get_max_value(get_agent_state_and_product_skill_observation_DISTQ_online(next_agent_num, actual_step['new_state']))
-                        obs = get_agent_state_and_product_skill_observation_DISTQ_online(agent_num, actual_step['old_state'])
-                        agent.update_values(obs, action, reward, agents_informations)
-
-            elif not test_model and custom_reward == 'reward5' and algorithm == 'LPI':
-                for actual_step in trajectory_for_semi_MDP:
-                    if actual_step['action_selected_by_algorithm']:
-                        agent_num = actual_step['old_state']['current_agent']
-                        agent = learning_agents[agent_num]
-                        action = actual_step['action']
-                        reward = actual_step['reward']
-                        if agent_num not in observations_history_LPI.keys():
-                            observations_history_LPI[agent_num] = {}
-                            observations_history_LPI[agent_num]['O'] = []
-                            observations_history_LPI[agent_num]['A'] = []
-                            observations_history_LPI[agent_num]['R'] = []
-
-                        observations_history_LPI[agent_num]['O'].append(agent.generate_observation(actual_step['old_state']))
-                        observations_history_LPI[agent_num]['A'].append(action)
-                        observations_history_LPI[agent_num]['R'].append(reward)
-
-                        if len(observations_history_LPI[agent_num]['O']) > 1:
-                            agent.update_values(observations_history_LPI[agent_num]['O'][-2], \
-                                                observations_history_LPI[agent_num]['A'][-2], \
-                                                observations_history_LPI[agent_num]['R'][-2], \
-                                                observations_history_LPI[agent_num]['O'][-1], \
-                                                observations_history_LPI[agent_num]['A'][-1])
-                            
-            if algorithm != 'random' and algorithm != 'FQI':
-                if not test_model and update_values == 'episode':
-                    for agent in learning_agents:
-                        agent.apply_values_update()
-                
-                if not test_model and policy_improvement == 'episode':
-                    for agent in learning_agents:
-                        agent.soft_policy_improvement()
-        
-        if greedy_step and not test_model:
-            num = len(greedy_fqi_performance)
-            greedy_fqi_performance[num] = {}
-            greedy_fqi_performance[num]['episode_duration'] = state['time']
-            greedy_fqi_performance[num]['agents_reward_for_plot'] = agents_rewards_for_plot
-
-            for i in range(n_agents):
-                mean_reward = np.mean(agents_rewards_for_plot[i])
-
-                greedy_fqi_performance[num][i] = {}
-                greedy_fqi_performance[num][i]['mean_reward'] = mean_reward
-        else:
-            performance[episode] = {}
-            performance[episode]['episode_duration'] = state['time']
-            performance[episode]['agents_reward_for_plot'] = agents_rewards_for_plot
-
-            for i in range(n_agents):
-                mean_reward = np.mean(agents_rewards_for_plot[i])
-
-                performance[episode][i] = {}
-                performance[episode][i]['mean_reward'] = mean_reward
-
-    if test_model:
-        info_for_plot_path = f"{model_path}/reward_for_plot_test.json"
+def compute_reward_rllib(reward, skill, non_production_skill):
+    """ Compute the reward in a Semi-MDP fashion for RLlib"""
+    overall_kpi = reward
+    if skill["Skill"] not in non_production_skill:
+        production_kpi = reward
     else:
-        info_for_plot_path = f"{model_path}/reward_for_plot_training.json"
-        if algorithm == 'FQI':
-            info_for_greedy_plot_path = f"{model_path}/reward_for_greedy_plot_training.json"
+        production_kpi = 0
+    return overall_kpi, production_kpi
 
-    with open(info_for_plot_path, 'w') as outfile:
-        json.dump(performance, outfile, indent=6)
 
-    if algorithm == 'FQI' and not test_model:
-        with open(info_for_greedy_plot_path, 'w') as outfile:
-            json.dump(greedy_fqi_performance, outfile, indent=6)
+def convert_action(action, agent):
+    return action  # action is converted to port directly in agent
 
-    if not test_model and algorithm != 'random' and algorithm != 'FQI':
-        for agent in learning_agents:
-            agent.save()
+
+def get_cppu_name(agent):
+    return f'cppu_{agent}'
+
+OUTPUT_PATH = config['output_path']
+TRAJECTORY_PATH = config['trajectory_path']
+communicator = initialize_agents(n_agents, algorithm, n_episodes, custom_reward,
+                          config['available_actions'], config['agents_connections'], mqtt_host_url=MQTT_HOST_URL)
+
+model_path = "models/rllib/"
+if not os.path.exists(model_path):
+    os.makedirs(model_path)
+run = 1
+env = ProductionPlantEnvironment(config, run=run, model_path=model_path, semiMDP_reward_config=semiMDP_reward_config)
+reward_visualizer = RewardVisualizer(n_agents)
+performance = {}
+
+cppu_names = [f'cppu_{i}' for i in range(n_agents)]
+non_production_skills = []
+if test_model:
+    file_log_name = f"{model_path}/test_logs.txt"
+else:
+    file_log_name = f"{model_path}/training_logs.txt"
+with open(file_log_name, 'w') as file:
+    file.write(f"")
 
 if test_model:
-    if algorithm != 'random' and algorithm != 'FQI':
-        plotter = DistQAndLPIPlotter(model_path_runs, baseline_path_runs, n_training_episodes)
-        plotter.plot_reward_graphs()
-        plotter.plot_performance_graph()
+    n_episodes = test_model_n_episodes
 
-if algorithm == 'FQI' and not test_model:
-    plotter = FQIPlotter(model_path_runs, test_episodes_for_fqi_iteration, multiple_exploration_probabilities, exploration_probabilities, episodes_for_each_explor_for_iteration)
-    if multiple_exploration_probabilities:
-        plotter.plot_performance_graph_multiple_epsilon()
+for episode in range(n_episodes):
+    if output_log:
+        # create log
+        with open(f"{OUTPUT_PATH}_{episode}.txt", 'w') as file:
+            file.write('')
+
+    if export_trajectories:
+        # create trajectory
+        trajectories = {f'Episode {episode}, Product {product}': [] for product in range(n_products)}
+        with open(f"{TRAJECTORY_PATH}_{episode}.json", 'w') as outfile:
+            json.dump(trajectories, outfile, indent=6)
+
+    with open(file_log_name, 'a') as file:
+        file.write(f"Starting episode {episode+1}\n")
+
+    # used for old reward counting (before new graph)
+    agents_rewards = [[] for _ in range(n_agents)]
+    # used for reward computation for new graph
+    agents_rewards_for_plot = {}
+    for i in range(n_agents):
+        agents_rewards_for_plot[i] = 0
+    if custom_reward == 'reward5':
+        trajectory_for_semi_MDP = []
+    previous_rewards = {}
+    state = env.reset()
+    old_state = copy.deepcopy(state)
+    episode_id = f"E{episode}"
+    communicator.publish_episode_management('Start', episode_id)
+    communicator.sync_episode()
+
+    for step in range(num_max_steps):
+        action_selected_by_algorithm = False
+
+        if np.all(np.array(state['action_mask'][state['current_agent']]) == 0) \
+                or state['agents_busy'][state['current_agent']][0] == 1:
+            # if no actions available -> do nothing
+            action = nothing_action
+        else:
+            action_selected_by_algorithm = True
+            cppu_name = get_cppu_name(state["current_agent"])
+            obs = get_rllib_state(state, one_hot_state=one_hot_state, old_state=old_state, use_masking=use_masking)
+            #obs_rllib = []
+            if cppu_name in previous_rewards:
+                overall_kpi, production_kpi = previous_rewards[cppu_name]
+                reshaped_reward = - shape_reward(overall_kpi=overall_kpi, production_kpi=production_kpi,
+                                                 shaping_value=shaping_value)
+            else:
+                reshaped_reward = None  # first time
+            previous_rewards[cppu_name] = (0, 0) # reset accumulators
+            threshold_detected = state["time"] > loop_threshold  # TODO: implement a  real threshold check
+            communicator.set_action_barrier(cppu_name)
+            communicator.send_state_and_previous_reward(cppu_name, obs, reshaped_reward, threshold_detected)
+            # only works for single product as we need to wait for the action on this agent
+            raw_action = communicator.receive_action(cppu_name)
+            action = convert_action(raw_action, state["current_agent"])
+        # Here send the message to the workers
+        previous_state = state
+        state, reward, done, info = env.step(action)
+        if action_selected_by_algorithm:
+            for agent in cppu_names:
+                if agent in previous_rewards:
+                        overall_kpi = reward
+                        production_kpi = 0
+                        if info["production_skill_executed"]:
+                            production_kpi = info["production_skill_duration"]
+                        previous_rewards[agent] = (previous_rewards[agent][0] + overall_kpi,
+                                                   previous_rewards[agent][1] + production_kpi)
+        if done:
+            break
+    if checkpoint_frequency is None:
+        save_checkpoint = False
     else:
-        plotter.plot_reward_graphs()
-        plotter.plot_performance_graph()
-        plotter.plot_single_run_performance_graph()
-        
+        save_checkpoint = True if (episode + 1) % checkpoint_frequency == 0 or episode == n_episodes - 1 else False
+    last_rewards = {}
+    for agent in cppu_names:
+        if agent in previous_rewards:
+            overall_kpi, production_kpi = previous_rewards[agent]
+            reshaped_reward = - shape_reward(overall_kpi=overall_kpi, production_kpi=production_kpi,
+                                             shaping_value=shaping_value)
+        else:
+            reshaped_reward = None
+        last_rewards[agent] = reshaped_reward
+    communicator.publish_episode_management('End', episode_id, produced_product=None, save_checkpoint=save_checkpoint,
+                                            last_rewards=last_rewards)
+    communicator.sync_episode()
+    print(f'Finished Episode {episode}!!')
+    # semi MDP reward postponed computation (at the end of the episode)
+    #
+    # performance[episode] = {}
+    # performance[episode]['episode_duration'] = state['time']
+    # performance[episode]['agents_reward_for_plot'] = agents_rewards_for_plot

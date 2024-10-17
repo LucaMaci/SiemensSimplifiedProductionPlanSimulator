@@ -1,10 +1,7 @@
 {
     "reward": "semiMDP",
     "positive_shaping": true,
-    "positive_shaping_equal": true,
-    "positive_shaping_constant": 25,
+    "positive_shaping_constant": 1,
     "negative_shaping": true,
-    "negative_shaping_constant": 500,
-    "semiMDP_till_end_of_episode": false,
-    "illegal_action_penalty": 500
+    "negative_shaping_constant": 500
 }

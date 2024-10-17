@@ -1,6 +1,5 @@
 {
     "algorithm": "LPI",
-    "use_action_masks": false,
     "test_model": true,
     "test_model_name": "models/reward4/LPI/LPI_eps-greedy_1000_0.01_0.99_0.0001_0__q_init:0_1_1_DEP",
     "test_model_n_episodes": 10,
@@ -13,7 +12,6 @@
     "actions": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
     "action_time": [5, 5, 5, 5, 5, 5, 2, 2, 2, 2, 2, 0],
     "action_energy": [3, 3, 3, 3, 3, 3, 1, 1, 1, 1, 1, 0],
-    "illegal_action_penalty": 500,
     "custom_reward": "reward4",
     "alpha": 0.7,
     "beta": 0.3,
