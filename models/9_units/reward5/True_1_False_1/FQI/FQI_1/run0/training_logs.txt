@@ -1,9 +1,0 @@
-Starting episode 1
-New product picked up by agent 0
-Agent 0 transfer product 0 to agent 1 (action: 9)
-Production skill 1 performed on product 0 by agent 1
-Agent 1 transfer product 0 to agent 4 (action: 10)
-Production skill 2 performed on product 0 by agent 4
-Agent 4 transfer product 0 to agent 5 (action: 9)
-Production skill 7 performed on product 0 by agent 5
-Episode 1 ended
