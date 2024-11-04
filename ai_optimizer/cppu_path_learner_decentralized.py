@@ -186,7 +186,7 @@ class Agent(AgentSImulator):
             #self.last_observation = observation[0]
 
         action = self.infer_action(observation)
-        port = self.get_port(int(action))
+        port = self.get_port(int(action), target_cppu = True)
         self.publish_port(port)
         self.logger.info('Action: {}'.format(action))
 
@@ -215,7 +215,7 @@ class Agent(AgentSImulator):
             'observation': observation,
             'rewards': reward,
             'info': {
-                'port': port,
+                'port': port[0],
                 'eid': eid,
                 # 'product_id': product_info,
                 'agent_information': agents_information
@@ -453,6 +453,8 @@ class Agent(AgentSImulator):
         self.mqtt_sub_client.subscribe(f'EpisodeManagement/#')
         self.mqtt_sub_client.subscribe(f'AgentReadyRequest/#')
         self.mqtt_sub_client.subscribe(f'UpdateValues/#')
+        self.mqtt_sub_client.subscribe(f'ProductMovement/#')
+        self.mqtt_sub_client.subscribe(f'SkillExecution/#')
         mqtt_topic_server_ready = '/'.join([SERVER_BASE_TOPIC, SERVER_READY_TOPIC, f'{self.cppu_name}'])
         self.mqtt_sub_client.subscribe(mqtt_topic_server_ready)
 
@@ -531,6 +533,10 @@ class Agent(AgentSImulator):
               and parameters[2] == self.cppu_name 
               and int(payload) == 1):
             threading.Thread(target= self.check_server_ready, args=[payload]).start()
+        elif (parameters[0] == "ProductMovement"):
+            threading.Thread(target= self.update_trajectories, args=[parameters[1:]]).start()
+        elif (parameters[0] == "SkillExecution"):
+            threading.Thread(target=self.update_skills_already_executed, args=[parameters[1:]]).start()
 
     def update_training_regime(self, payload):
         """Update Trainig Regime with code
@@ -575,6 +581,10 @@ class Agent(AgentSImulator):
 
     def publish_port(self, port):
         """Method used to publish the port selected by the Agent to the Simulator"""
+        target_cppu = port[1]
+        port = port[0]
+        self.publish_product_movement(self, self.cppu_name, target_cppu)
+        
         exchange_dict = self.exchange_dicts['path']
         exchange_dict['port'] = port
 
@@ -585,6 +595,15 @@ class Agent(AgentSImulator):
             self.mqtt_pub_client.publish(mqtt_topic,
                                          json.dumps({"port": port}))
         self.logger.info(f'Port {port}')
+    
+    def publish_product_movement(self, from_cppu, to_cppu, product_number = 0): #LUCA does this work well with multiple products, or does desync cause issues?
+        mqtt_topic = '/'.join(['ProductMovement',
+                               from_cppu,
+                               to_cppu,
+                               product_number])
+        with self.mqtt_pub_client_lock:
+            self.mqtt_pub_client.publish(mqtt_topic,
+                                         json.dumps({"product": product_number}))
 
     def publish_variant(self, cppu, variant, id_mqtt):
         """Method used to publish the variat chose by the agent"""

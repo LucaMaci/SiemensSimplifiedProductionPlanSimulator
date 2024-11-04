@@ -110,6 +110,7 @@ class ProductionPlantEnvironment():
             self.action_mask[self.current_agent] = self.compute_mask(self.current_agent, actual_product)
             self.agents_busy[self.current_agent] = (1, self.time + action_time)
             self.output_generator.production_skill_log(action, actual_product, self.current_agent)
+            self.publish_skill_execution(actual_product, action) #LUCA
         # perform transfer actions
         elif action < self.n_production_skills + 4:
             next_agent = self._get_next_agent(self.current_agent, action)
@@ -199,7 +200,7 @@ class ProductionPlantEnvironment():
 
         state, reward, done, _ = self._internal_step(action, True)
         state, reward, done, _ = self._perform_internal_steps(state, done)
-        return state, reward, done, info
+        return state, reward, done, info, product
 
     def _perform_internal_steps(self, state, done = 0):
         start_time = state['time'] - 1
@@ -236,7 +237,8 @@ class ProductionPlantEnvironment():
             next_skill = [i for i in range(len(products_state[product])) if 1 in products_state[product][i]][0]
             if next_skill in self.agents_skills[next_agent]:
                 return {'production_skill_executed': True, 'transport_duration': self._get_action_time(agent, action),
-                        'production_skill_duration': self._get_action_time(next_agent, next_skill)}
+                        'production_skill_duration': self._get_action_time(next_agent, next_skill),
+                        'skill': next_skill}
             else:
                 return {'production_skill_executed': False, 'transport_duration': self._get_action_time(agent, action)}
 

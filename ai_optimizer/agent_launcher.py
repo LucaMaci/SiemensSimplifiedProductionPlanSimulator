@@ -270,6 +270,7 @@ if __name__ == "__main__":
             logger.info(f'Launching Agent::{cppu_name}')
             logger.debug(f" > {' '.join(cmd)}")
             print(' '.join(cmd[2:]))
+            #running cppu_path_learner_decentralized.py
             #launcher_processes[cppu_name] = subprocess.Popen(cmd)
 
         # Launch orchestrator

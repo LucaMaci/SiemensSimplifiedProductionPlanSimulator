@@ -9,6 +9,8 @@ import paho.mqtt.client as mqtt
 from custom_policies import get_string_observation
 import gymnasium as gym
 
+from collections import deque
+import math
 
 ENV_SIMULATOR = 'CPPS_SIMULATOR_HOME'
 # TODO FIX MAX SKILL TO BE COMPUTED
@@ -61,6 +63,8 @@ class AgentSImulator():
             self.logger.debug(f"Loading products from folder")
             self.products = self.__load_from_folder('products.json')
         
+        self.learning_config = learning_config
+
         # set the CPPU names used in the simulator including the plant
         self.n_agents = self.config["n_agents"]
         self.all_cppu_names = [f'cppu_{i}' for i in range(self.n_agents)]
@@ -68,19 +72,29 @@ class AgentSImulator():
         # set the CPPU names used in the simulator that are not a plant
         self.real_cppu_names = [f'cppu_{i}' for i in range(self.n_agents)]
         self.cppc_name = "" # TODO don't know if needed
-        self.cppu_dictionary = {real_cppu_name: i-1 for i, real_cppu_name in enumerate(self.real_cppu_names, 1)}
         self.cppu_name = cppu_name
         self.index = cppu_name.split("_")[-1]
         if self.cppu_name in self.real_cppu_names:
             self.ports_info = None # TODO don't know if needed
-            self.ports = [i for i, value in enumerate(config["agents_connections"][self.index]) if value is not None]
+            self.ports = [(i,cppu) for i, cppu in enumerate(config["agents_connections"][self.index]) if cppu is not None]
             # self.ports = [port for port in self.get_ports(cppu_name) if
             #               self.get_port_simulator(cppu_name, port) ['Configuration']['Connected'] is not None]
             self.skills = self.get_skills(self.cppu_name)
             self.skill_durations = self.config["agents_skills_custom_duration"]
 
+        self.working_cppus_mask = [1]*len(self.real_cppu_names) #Keeps track of the "CppuFailure" mqtt topic's information
+        self.ports_unoccupied = [port for port, cppu in self.ports]
+        self.ports_unoccupied_mask = [1]*len(self.ports)
+        self.agents_connections = self.config["agents_connections"]
+        
+        self.products_required_skills_initially = self.product_state_format_conversion(np.array(self.config["products_starting_state"]))
         self.product_names = [f'product_{i}' for i in range(self.config["n_products"])]
+        self.product_skills_already_executed = {product : [] for product in self.product_names} #LUCA - TODO: update via mqtt message every time a skill is performed on a product
         self.skill_names = [f'skill_{i}' for i in range(self.config["n_production_skills"])]
+        #self.non_production_skills = self.learning_config['non_production_skills']
+        
+        #self.logger.info(f"Plant's available production skills: {self.production_skills}")
+        #self.direct_neighbours = 0
 
         # self.product_names = self.get_subproducts(self.product_names, self.products)
         # self.product_names.sort()
@@ -90,19 +104,34 @@ class AgentSImulator():
         # self.product_skills_pair = self.get_skills_per_product(self.products)
         
         # Learning-realted quantities
-        self.learning_config = learning_config
         self.one_hot_state = self.learning_config['one_hot_state']
         self.shaping_value = self.learning_config['shaping_value']
+        
+        self.neighbourhood_size = self.learning_config["neighbourhood_size"]
+        self.constant_positive_shaping_flag = self.learning_config["constant_positive_shaping_flag"]
+        self.positive_shaping_constant = self.learning_config["positive_shaping_constant"]
+        self.positive_shaping_coefficient = self.learning_config['positive_shaping_coefficient']
+        self.time_shaping_coefficient = self.learning_config['time_shaping_coefficient']
+        
         self.fact_duration = self.learning_config['fact_duration']
         self.fact_energy = self.learning_config['fact_energy']
         self.use_masking = self.learning_config['use_masking']
 
-        self.observation_space_dict = {key: value for (key, value) in
-                                       self.learning_config["observation_space_dict"].items() if value}
+        self.observation_space_dict = {key:value for (key,value) in self.learning_config["observation_space_dict"].items() if value}
+        self.neighbour_skills_ohe = {}
+        self.next_skills_horizon = self.learning_config["next_skills_horizon"]
+        self.prev_cppu_encoding = self.learning_config["prev_cppu_encoding"]     # 0 -> OHE, 1 -> LABEL
+        self.next_skills_encoding = self.learning_config["next_skills_encoding"] # 0 -> OHE, 1 -> LABEL
         self.action_space = gym.spaces.Discrete(len(self.ports))
-        self.non_production_skill = ["transport", "defer", "buffer"]
         self.counter_dict = {}
+        
 
+        self.full_neighbours_products = {cppu: 0 for cppu in self.real_cppu_names}
+        self.neighbourhoods = None
+        self.distances_dictionary = {}
+        self.trajectories = {product: [] for product in self.product_names}
+        self.observation_space_separation_points = {}
+        
         # create a mutex for the good quality storage
         self.storage_lock = multiprocessing.Lock()
 
@@ -136,10 +165,13 @@ class AgentSImulator():
             product_table[cppu] = self.get_products(cppu)
         return product_table
 
-    def get_port(self, port_index):
+    def get_port(self, port_index, target_cppu = False):
         """Given a selected action(a port index), 
         return the corresponding port string"""
-        return self.ports[port_index]
+        if target_cppu == False:
+            return self.ports[port_index][0]
+        else:
+            return self.ports[port_index]
     
     def get_next_cppu_name(self, next_port):
         cppu_config = self.config['plant_layout'][self.cppu_name]
@@ -204,7 +236,7 @@ class AgentSImulator():
                 break
             history_counter += 1
         self.logger.info(f"KPI base reward: {overall_kpi}")
-        reshaped_reward = - self.shape_reward(overall_kpi=overall_kpi, production_kpi=production_kpi)
+        reshaped_reward = self.shape_reward(overall_kpi=overall_kpi, production_kpi=production_kpi)
         self.logger.info(f"KPI reshaped reward: {reshaped_reward}")
         return reshaped_reward
     
@@ -212,10 +244,11 @@ class AgentSImulator():
     def shape_reward(self, overall_kpi, production_kpi):
         """
         Shape the reward
-        - non_production_kpi: any kind of ,
-        - skills_duration: is the duration due to execution skills (it's contained in computed_duration)
+        - overall_ : referring to the entire history of the product. (e.g. "Duration"/"EnergyConsumption" since start of production)
+        - production_ : referring only to the self.production_skills part of the product's history (e.g. "Duration"/"EnergyConsumption" spent executing production skills)
+        - _kpi: actual value is a custom combination of the two KPI types "Duration" and "EnergyConsumption". Check combination used in self.extract_kpi().
         """
-        return overall_kpi - self.shaping_value * production_kpi
+        return self.positive_shaping_coefficient * production_kpi - self.time_shaping_coefficient * overall_kpi
 
     def compute_reward_rllib(self, skill_history):
         """ Compute the reward in a Semi-MDP fashion for RLlib"""
@@ -233,14 +266,17 @@ class AgentSImulator():
                 break
             history_counter += 1
         self.logger.info(f"RLLib Computed reward: {overall_kpi}")
-        reshaped_reward = - self.shape_reward(overall_kpi=overall_kpi, production_kpi=production_kpi)
+        reshaped_reward = self.shape_reward(overall_kpi=overall_kpi, production_kpi=production_kpi)
         self.logger.info(f"RLLib Shaped reward: {reshaped_reward}")
         return reshaped_reward
 
-    def get_action_space_ohe(self):
+    def get_observation_space_ohe(self):
         obs_space_low = []
         obs_space_high = []
         if self.observation_space_dict.get("next_skill", False):
+            obs_space_low.append(np.zeros(len(self.skill_names)))
+            obs_space_high.append(np.ones(len(self.skill_names)))
+        if self.observation_space_dict.get("prev_skill", False):
             obs_space_low.append(np.zeros(len(self.skill_names)))
             obs_space_high.append(np.ones(len(self.skill_names)))
         if self.observation_space_dict.get("product_name", False):
@@ -250,14 +286,29 @@ class AgentSImulator():
             obs_space_low.append(np.zeros(len(self.product_names)))
             obs_space_high.append(np.ones(len(self.product_names)))
         if self.observation_space_dict.get("next_skills", False):
-            obs_space_low.append(np.zeros(len(self.skill_names)))
-            obs_space_high.append(np.ones(len(self.skill_names)))
+            obs_space_low.append(np.zeros(len(self.skill_names)*self.next_skills_horizon))
+            obs_space_high.append(np.ones(len(self.skill_names)*self.next_skills_horizon)) 
         if self.observation_space_dict.get("counter", False):
             obs_space_low.append(np.zeros(1))
             obs_space_high.append(np.ones(1))
         if self.observation_space_dict.get("previous_cppu", False):
-            obs_space_low.append(np.zeros(len(self.cppu_dictionary)))
-            obs_space_high.append(np.ones(len(self.cppu_dictionary)))
+            obs_space_low.append(np.zeros(len(self.real_cppu_names)))
+            obs_space_high.append(np.ones(len(self.real_cppu_names)))
+        if self.observation_space_dict.get("least_hops", False):
+            obs_space_low.append(np.zeros(4)) 
+            obs_space_high.append(np.ones(4)*len(self.real_cppu_names))
+        if self.observation_space_dict.get("neighbours_products", False):
+            if self.neighbourhoods is None:
+                self.neighbourhoods = self.get_neighbourhoods()
+            self.observation_space_separation_points["neighbours_products"] = len(obs_space_high)
+            obs_space_low.append(np.zeros(len(self.real_cppu_names)))
+            obs_space_high.append(np.ones(len(self.real_cppu_names))*(len(self.product_names)+1)) # "outside-of-neighbourhood" cppus will be given value len(self.product_names)+1
+        if self.observation_space_dict.get("neighbours_skills", False):
+            if self.neighbourhoods is None:
+                self.neighbourhoods = self.get_neighbourhoods()
+            obs_space_low.append(np.zeros(len(self.skill_names)*len(self.real_cppu_names)))
+            obs_space_high.append(np.ones(len(self.skill_names)*len(self.real_cppu_names))*2)
+            
         obs_space_low = np.concatenate(obs_space_low)
         obs_space_high = np.concatenate(obs_space_high)
         return gym.spaces.Box(low=obs_space_low, high=obs_space_high)
@@ -265,7 +316,7 @@ class AgentSImulator():
     def get_observation_space(self):
         """ Return a list with the dimensionality of each component of the observation """
         if self.one_hot_state:
-            space = self.get_action_space_ohe()
+            space = self.get_observation_space_ohe()
         else:
             obs_space = []
             if self.observation_space_dict.get("next_skill", False):
@@ -279,8 +330,51 @@ class AgentSImulator():
             if self.observation_space_dict.get("counter", False):
                 obs_space.append(2)  # binary
             if self.observation_space_dict.get("previous_cppu", False):
-                obs_space.append(len(self.cppu_dictionary))
+                obs_space.append(len(self.real_cppu_names))
             space = gym.spaces.MultiDiscrete(obs_space)
+            
+            
+            obs_space_low = []
+            obs_space_high = []
+            if self.observation_space_dict.get("next_skill", False):
+                obs_space_low.append(np.zeros(len(self.skill_names)))
+                obs_space_high.append(np.ones(len(self.skill_names)))
+            if self.observation_space_dict.get("prev_skill", False):
+                obs_space_low.append(np.zeros(len(self.skill_names)))
+                obs_space_high.append(np.ones(len(self.skill_names)))
+            if self.observation_space_dict.get("product_name", False):
+                obs_space_low.append(np.zeros(len(self.product_names)))
+                obs_space_high.append(np.ones(len(self.product_names)))
+            if self.observation_space_dict.get("cppu_state", False):
+                obs_space_low.append(np.zeros(len(self.product_names)))
+                obs_space_high.append(np.ones(len(self.product_names)))
+            if self.observation_space_dict.get("next_skills", False):
+                obs_space_low.append(np.zeros(self.next_skills_horizon))
+                obs_space_high.append(np.ones(self.next_skills_horizon)*(len(self.skill_names)+1))
+            if self.observation_space_dict.get("counter", False):
+                obs_space_low.append(np.zeros(1))
+                obs_space_high.append(np.ones(1))
+            if self.observation_space_dict.get("previous_cppu", False):
+                obs_space_low.append(0)
+                obs_space_high.append(len(self.real_cppu_names)) 
+            if self.observation_space_dict.get("least_hops", False):
+                obs_space_low.append(np.zeros(4)) 
+                obs_space_high.append(np.ones(4)*len(self.real_cppu_names))
+            if self.observation_space_dict.get("neighbours_products", False):
+                if self.neighbourhoods is None:
+                    self.neighbourhoods = self.get_neighbourhoods()
+                self.observation_space_separation_points["neighbours_products"] = len(obs_space_high)
+                obs_space_low.append(np.zeros(len(self.real_cppu_names)))
+                obs_space_high.append(np.ones(len(self.real_cppu_names))*(len(self.product_names)+1)) # "outside-of-neighbourhood" cppus will be given value len(self.product_names)+1
+            if self.observation_space_dict.get("neighbours_skills", False):
+                if self.neighbourhoods is None:
+                    self.neighbourhoods = self.get_neighbourhoods()
+                obs_space_low.append(np.zeros(len(self.skill_names)*len(self.real_cppu_names)))
+                obs_space_high.append(np.ones(len(self.skill_names)*len(self.real_cppu_names))*2)
+            
+            obs_space_low = np.concatenate(obs_space_low)
+            obs_space_high = np.concatenate(obs_space_high)
+            space = gym.spaces.Box(low=obs_space_low, high=obs_space_high)
 
         if self.use_masking:
             space = gym.spaces.Dict(
@@ -322,19 +416,19 @@ class AgentSImulator():
         """Given the product, create the embedding with all the skills
             required for its production"""
         skills_to_encode = self.product_skills_pair[product_name]
-        basic_encoding = [0] * len(self.skill_names)
+        encoding = [0] * len(self.skill_names)
         for skill in skills_to_encode:
             idx = self.skill_names.index(skill)
-            basic_encoding[idx] += 1
-        return basic_encoding
+            encoding[idx] += 1
+        return encoding
 
     def get_skills_encoding(self, skills_list):
         """Given a list of the skills, create the encoding"""
-        basic_encoding = [0] * len(self.skill_names)
+        encoding = [0] * len(self.skill_names)
         for skill in skills_list:
             idx = self.skill_names.index(skill)
-            basic_encoding[idx] += 1
-        return basic_encoding
+            encoding[idx] += 1
+        return encoding
 
     def get_update_skill_encoding(self, product_name, skill_executed):
         """Get the embedding of the remaining skills to be executed (by difference)"""
@@ -342,24 +436,27 @@ class AgentSImulator():
         skills_executed = self.get_skills_encoding(skill_executed)
         return [x - y if x >= y else 0 for x,y in zip(original_encoding, skills_executed)]
 
-    def get_skills_history(self, product_info):
+    def get_skills_history(self, product_name):
         """Return a list of the skills already executed on the product"""
-        skills_executed = []
-        if "States" in product_info.keys():
-            product_skill_history = product_info["States"]["SkillHistory"]
-            self.logger.debug(f'{self.cppu_name}: product skill history is {product_skill_history}')
-            for skill_info in product_skill_history:
-                if skill_info["Skill"] != "transport":
-                    self.logger.debug(f'{self.cppu_name}: ' +
-                                      f'skill already executed is {skill_info["Skill"]}')
-                    skills_executed.append(skill_info["Skill"])
+        return self.product_skills_already_executed(product_name)
+    
+    def get_cppu_encoding(self, cppu_name):
+        """Returns OHE/Categorical encoding of the previous cppu"""
+        if self.prev_cppu_encoding == 0: #OHE
+            encoding = [0] * len(self.real_cppu_names)
+            if cppu_name in self.real_cppu_names:
+                encoding[self.real_cppu_names.index(cppu_name)] = 1
+        elif self.prev_cppu_encoding == 1: #Categorical
+            encoding = [cppu_name.split("_")[-1]]
+        return encoding
 
-        self.logger.debug(f'{self.cppu_name}: skills_executed are {skills_executed}')
-     
-        return skills_executed
+    def update_skills_already_executed(self, product, skill):
+        """Called via mqtt messaging when a skill is executed on a product"""
+        self.product_skills_already_executed[product].append(skill)
+
     
     def get_next_agent_observation(self, observation, port):
-
+        #OUTDATED: will need edits if it's needed. For rllib, it is not needed.
         next_cppu = self.get_next_cppu_name(port)
         counter_dict = self.get_whiteboard(next_cppu)['counter_dict']
         
@@ -491,9 +588,9 @@ class AgentSImulator():
         """return the names of the units that should have the store skill"""
         return [name for name, config in self.config['plant_layout'].items()
                 if config.get('hasStore', False)]
-
+    """
     def delete_products_after_condition(self, augmented_product_name, cppu_threshold_detected = None):
-        """return the product information as a dictionary and deletes the product from the storage"""
+        #return the product information as a dictionary and deletes the product from the storage
         self.logger.info(f"Entering Deletion of Products: {augmented_product_name}")
         with self.storage_lock:
             product_info = None
@@ -520,21 +617,243 @@ class AgentSImulator():
             else:
                 self.logger.debug(f"Production Threshold: ELSE CONDITION {product_id} from CPPU {cppu_name}")
         return product_type, product_info
+    """
+    
+    def update_trajectories(self, from_cppu, to_cppu, product_number):
+        """Update the dictionary self.full_neighbours_products, containing 
+        the current number of products held by each cppu in the plant"""
+        if from_cppu is not None and to_cppu is not None:
+            if self.full_neighbours_products(from_cppu) > 0: #So the very first cppu doesn't go to -1 after the first ever transport of a product
+                self.full_neighbours_products(from_cppu) -= 1
+            self.full_neighbours_products(to_cppu) += 1
+            self.trajectories[f"product_{product_number}"].append(to_cppu)
+    
     
     def get_skill_distance_from_port(self, skill, port):
         """Given the required skill and the current port,
         compute the number of hops before reaching 
         an agent able to handle the task required"""
-        port_info = self.ports_info[port]
-        skills_info = port_info['States']['Skills']
-        if skill in skills_info:
-            plugged_equipment = skills_info[skill]['PluggedEquipment']
-            distance = min([equipment_info['Distance'] for equipment_info in plugged_equipment.values()])
-            return distance
-        else:
-            # ... otherwise return the maximum possible CPPU hops value
-            return len(self.real_cppu_names) - 1
+        target_cppu = port[1]
+        distance = len(self.real_cppu_names)
+        for cppu in self.real_cppu_names:
+            if skill in self.get_skills(cppu):
+                distance = min(distance, self.get_distance(cppu, target_cppu))
+            
+    def get_distance(self, cppu1, cppu2):
+        """Return the number of hops between two cppus"""
+        if self.distances_dictionary.get(cppu1, False):
+            return self.distances_dictionary[cppu1][cppu2]
+        if self.distances_dictionary.get(cppu2, False):
+            return self.distances_dictionary[cppu2][cppu1]
+        self.distances_dictionary[cppu1] = self.get_distances_from_cppu(cppu1)
+        return self.distances_dictionary[cppu1][cppu2]
 
+            
+    def get_least_hops_to_skill(self, skill, cppu_name):
+        """Given the required skill and starting from cppu_name, 
+        compute the number of hops required to reach an agent able to handle the skill required 
+        while starting from each of the 4 ports. 
+        Non-connected ports are given the otherwise unobtainable value of len(self.real_cppu_names)"""
+        least_hops_to_skill = []
+        connections = self.agents_connections[cppu_name.split('_')[-1]]
+        ports = [(port, cppu) for port, cppu in enumerate(connections) if cppu is not None]
+        
+        for port in ["0", "1", "2", "3"]:
+            if port not in ports:
+                least_hops_to_skill.append(len(self.real_cppu_names))
+            else:
+                target_cppu = ports[port][1]
+                distance = len(self.real_cppu_names)
+                cppus_with_skill = [cppu for cppu in self.real_cppu_names if skill in self.get_skills(cppu)]
+                for cppu_with_skill in cppus_with_skill:
+                    distance = min(distance, self.get_distance(cppu_with_skill, target_cppu))
+                least_hops_to_skill.append(min)
+        return least_hops_to_skill
+
+    def get_distances_from_cppu(self, cppu_name):
+        """returns the dictionary of distances between cppu_name and all other cppus plant"""
+
+        if self.distances_dictionary.get(cppu_name, False):
+            return self.distances_dictionary[cppu_name]
+
+        visited = {cppu_name: 0}
+        queue = deque([(cppu_name, 0)])
+        
+        while queue:
+            current_agent, depth = queue.popleft()
+            
+            connections = self.agents_connections[current_agent.split('_')[-1]]
+            ports_info = [(port, cppu) for port, cppu in enumerate(connections) if cppu is not None]
+            for port_info in ports_info:
+                target_cppu = port_info[1]
+                if target_cppu and target_cppu not in visited:
+                    visited[target_cppu] = depth + 1
+                    queue.append((target_cppu, depth + 1))
+                    
+        self.distances_dictionary[cppu_name] = visited         
+        return visited  
+            
+   
+    def get_neighbours_products(self, cppu_name):
+        """returns a list (ordered as self.real_cppu_names) of the information about each cppu obtained from get_neighbours_products_dict"""
+
+        if cppu_name not in self.neighbourhoods:
+            self.neighbourhoods = self.get_neighbourhoods()
+        neighbourhood = self.neighbourhoods[cppu_name]
+
+        neighbours_products = []
+        for cppu in self.real_cppu_names:
+            if cppu in neighbourhood:
+                neighbours_products.append(self.full_neighbours_products[cppu])
+            else:
+                neighbours_products.append(len(self.product_names)+1) 
+                
+        return neighbours_products 
+
+
+    def product_state_format_conversion(self, products_starting_state):
+        
+        converted_states = {}
+        for product, starting_state in enumerate(products_starting_state):
+            converted_states.update({product: []})
+            step = 1
+            while np.any(starting_state != 0):
+                for skill_index, order_list in enumerate(starting_state):
+                    if step in order_list:
+                        converted_states[product].append(skill_index)
+                        index_in_order_list = order_list.index(step)
+                        order_list[index_in_order_list] = 0      
+                step += 1
+                if step > 300:
+                    ValueError("Error in products_starting_state's format")
+            
+        return converted_states
+
+    def get_next_skills_encoding(self, product_number, only_next_skill = False):
+        """Returns the OHE/Categorical encoding of the next 'self.next_skills_horizon' skills to perform on the product.
+        If the skills left to perform are less than the 'self.next_skills_horizon' quantity, pads the end of the encoding with 0s."""
+                    
+        starting_skills = self.products_required_skills_initially[product_number]
+        already_executed_skills = self.product_skills_already_executed[product_number]
+
+        next_skills = []
+        for step ,skill in enumerate(starting_skills):
+            if step < len(already_executed_skills):
+                if starting_skills[step] != already_executed_skills[step]:
+                    ValueError(f"Product history for {f'product_{product_number}'} doesn't match the sequence of skills it required")
+            else:
+                next_skills.append(skill)
+                if only_next_skill:
+                    return skill
+            
+            
+        encoding = [] 
+        if self.next_skills_encoding == 0:
+            no_more_skills_encoding = [0]*len(self.skill_names)
+            while len(encoding) < self.next_skills_horizon * len(self.skill_names):
+                if next_skills != []:
+                    skill_encoding = no_more_skills_encoding
+                    skill_encoding[next_skills.pop(0)] = 1
+                    encoding.extend(skill_encoding)
+                else:
+                    encoding.extend(no_more_skills_encoding)
+
+        elif self.next_skills_encoding == 1:
+            encoding = (next_skills + [0]*self.next_skills_horizon)[:self.next_skills_horizon]
+            
+        return encoding
+    
+
+    def get_neighbours_skills_ohe(self, cppu_name):
+        """returns a list (ordered as self.real_cppu_names) of the integer encodings
+        of the skills available in each of the cppus obtained from self.get_neighbours"""   
+             
+        neighbourhood = self.neighbourhoods[cppu_name]
+        encodings = []
+        for cppu in self.real_cppu_names:
+            if cppu in neighbourhood.keys():
+                skills_list = self.get_skills(cppu)
+                for skill in self.skill_names:
+                    encodings.append(int(skill in skills_list))
+            else:
+                encodings.extend([0]*len(self.skill_names))
+            self.neighbour_skills_ohe[cppu_name] = encodings
+
+        return self.neighbour_skills_ohe[cppu_name] 
+
+
+    def get_neighbourhoods(self):
+        """returns the list of cppus in the neighbourhood of the cppu_name"""
+        neighbourhoods = {}
+        for cppu1 in self.real_cppu_names:
+            neighbourhoods[cppu1] = {}
+            distances_from_cppu1 = self.get_distances_from_cppu(cppu1)
+            for cppu2 in self.real_cppu_names:
+                distance = distances_from_cppu1[cppu2]
+                if distance <= self.neighbourhood_size:
+                    neighbourhoods[cppu1].update({cppu2: distance})
+        return neighbourhoods
+        
+
+    def get_last_production_skill(self, product_number):
+        """Return the latest production skill executed on the product. depth == 1 -> last skill"""
+
+        product_skills_already_executed = self.product_skills_already_executed[product_number]
+        if len(product_skills_already_executed) > 0:
+            return product_skills_already_executed[-1]
+        else:
+            return "NoSkills"
+    
+
+    def print_observation(self, observation): 
+        """observation_space_separation_points has yet to be implemented"""
+        swapped_dict = {v: k for k, v in self.observation_space_separation_points.items()}
+        starting_points = sorted(swapped_dict.keys())
+        log_text = ""
+        for i in range(len(starting_points)):
+            if i < len(starting_points)-1:
+                log_text += f"Observation type: {swapped_dict[starting_points[i]]}\n"
+                log_text += f"Observation: {observation[starting_points[i]:starting_points[i+1]]}\n"
+            else:
+                log_text += f"Observation type: {swapped_dict[starting_points[i]]}\n"
+                log_text += f"Observation: {observation[starting_points[i]:]}\n"
+        self.logger.info(log_text)
+
+
+    def update_ports_unoccupied(self, cppu_name = None, updated_cppu_status = None):
+        #OUTDATED
+        """Updates the self.working_cppus_mask list according to the inputs from the MQTT CppuFailure topic (if there are any), 
+        then updates the self.ports_unoccupied and self.ports_unoccupied_mask lists with the most recent information."""
+
+        if (cppu_name is None) ^ (updated_cppu_status is None):
+            ValueError("Error calling update_ports_unoccupied: both cppu_name and updated_cppu_status must be either None or not None")
+
+        if cppu_name is not None and updated_cppu_status is not None: #MQTT CppuFailure was published
+            self.working_cppus_mask[self.real_cppu_names.index(cppu_name)] = int(updated_cppu_status)    
+
+        self.ports_unoccupied_mask = self.get_ports_unoccupied_mask(self.cppu_name)
+        self.ports_unoccupied = [self.ports[i] for i in range(len(self.ports)) if self.ports_unoccupied_mask[i]]   
+
+    
+
+    def get_ports_unoccupied_mask(self, cppu_name):
+        #OUTDATED
+        """Returns a binary mask for the ports of a specified cppu: 1 if the cppu reached by that port is 
+        currently registered as available in the self.working_cppus_mask list AND according to the get_ports_deep information, 0 otherwise"""
+
+        ports = [port for port in self.get_ports(cppu_name) if self.get_port_simulator(cppu_name, port) ['Configuration']['Connected'] is not None]
+        ports_info = self.get_ports_deep(cppu_name)
+        ports_unoccupied_mask = []
+
+        for port in ports:
+            target_cppu = ports_info[port]['Configuration']['Connected']['Equipment']
+            if ports_info[port]['Configuration']['Available'] and not ports_info[port]['States']['Occupied'] and self.working_cppus_mask[self.real_cppu_names.index(target_cppu)]:
+                ports_unoccupied_mask.append(1)
+            else:
+                ports_unoccupied_mask.append(0)
+        return ports_unoccupied_mask
+                  
+            
     def get_product_names(self):
         return list(self.products.keys())
 
@@ -568,6 +887,7 @@ class AgentSImulator():
     
     
     def get_observation(self, product_info):
+        #NOT USED IN SAC/rllib
         """ Extract information from the Simulator and construct the observation"""
         products_in_cppu = list(self.get_products(self.cppu_name))
         products_in_cppu_name = [self.get_product(self.cppu_name, product_id[0])
@@ -613,15 +933,18 @@ class AgentSImulator():
             observation = self.get_masking_observation(observation)
         return observation
     
-    def get_previous_observation(self, product_info):
+    def get_previous_observation(self, product_number):
 
         # TODO: Products in the previous cppu
-        products_encoding_per_cppu = [1]
-        previous_skills_executed, previous_skill = self.get_previous_skills(product_info)
-        current_product_name = product_info['Configuration']['Product'].split(':')[0]
-        next_skills_encoding = self.get_update_skill_encoding(product_info['Configuration']['BOP']
-                                                              [0]['Parameters']['Product'], previous_skills_executed)
-        previous_cppu = self.get_previous_cppu_name(product_info)
+        products_encoding_per_cppu = [product_number] #LUCA: Not sure about this one
+        previous_skill = self.product_skills_already_executed[product_number][-1]
+        current_product_name = f"product_{product_number}"
+        next_skill = self.get_next_skills_encoding(product_number, only_next_skill=True)
+        next_skills_encoding = self.get_next_skills_encoding(product_number)
+        previous_cppu = self.get_previous_cppu_name(product_number)
+        least_hops = self.get_least_hops_to_skill(next_skill,self.cppu_name)
+        neighbours_products = self.get_neighbours_products(self.cppu_name)
+        neighbours_skills = self.get_neighbours_skills_ohe(self.cppu_name)
 
         counter_key_list = []
         if self.observation_space_dict.get('product_name', False):
@@ -644,11 +967,17 @@ class AgentSImulator():
             elif field_name == "cppu_state":
                 observation.append(products_encoding_per_cppu)
             elif field_name == "next_skills":
-                observation.append(next_skills_encoding)
+                observation.extend(next_skills_encoding)
             elif field_name == "counter":
                 observation.append(counter)
             elif field_name == "previous_cppu":
-                observation.append(previous_cppu)
+                observation.extend(previous_cppu)
+            elif field_name == "least_hops":        
+	            observation.extend(least_hops)
+            elif field_name == "neighbours_products":
+                observation.extend(neighbours_products)
+            elif field_name == "neighbours_skills":
+                observation.extend(neighbours_skills)
 
         observation = tuple(observation)
         return observation
@@ -690,7 +1019,7 @@ class AgentSImulator():
         else:
             current_step = product_info['States']['CurrentBOPStep']
             required_skill = product_info['Configuration']['BOP'][current_step]['Skill']
-        distance_array = [self.get_skill_distance_from_port(required_skill, port) for port in self.ports]
+        distance_array = [self.get_skill_distance_from_port(required_skill, port) for port in self.ports] 
         return np.array(distance_array)
     
     
@@ -699,48 +1028,78 @@ class AgentSImulator():
         
         obs_rllib = []
 
+        index_shift = 0
         if self.observation_space_dict.get("next_skill", False):
-            skill_name = observation[self.get_position_in_observation('next_skill')]
+            skill_name = observation[index_shift + self.get_position_in_observation('next_skill')]
             assert isinstance(skill_name, str)
             obs_rllib.append(self.skill_names.index(skill_name))
+        if self.observation_space_dict.get("prev_skill", False):
+            skill_name = observation[index_shift + self.get_position_in_observation('prev_skill')]
+            assert isinstance(skill_name, str)
+            obs_rllib.append(len(self.skill_names) if skill_name == "NoSkills" else self.skill_names.index(skill_name))
         if self.observation_space_dict.get("product_name", False):
-            product_name = observation[self.get_position_in_observation('product_name')]
+            product_name = observation[index_shift + self.get_position_in_observation('product_name')]
             assert isinstance(product_name, str)
             obs_rllib.append(self.product_names.index(product_name))
         if self.observation_space_dict.get("cppu_state", False):
-            cppu_state = observation[self.get_position_in_observation('cppu_state')]
+            cppu_state = observation[index_shift + self.get_position_in_observation('cppu_state')]
             assert isinstance(cppu_state, list)
             obs_rllib.append(binary_list_to_int(cppu_state))
         if self.observation_space_dict.get("next_skills", False):
-            next_skills = observation[self.get_position_in_observation('next_skills')]
+            starting_index = index_shift + self.get_position_in_observation('next_skills')
+            observation_size = self.next_skills_horizon if self.next_skills_encoding == 1 else self.next_skills_horizon * len(self.production_skills)
+            index_shift += observation_size - 1
+            next_skills = list(observation[starting_index : starting_index + observation_size])
             assert isinstance(next_skills, list)
-            obs_rllib.append(binary_list_to_int(next_skills))
+            obs_rllib.extend(next_skills)
         if self.observation_space_dict.get("counter", False):
-            counter = observation[self.get_position_in_observation('counter')]
+            counter = observation[index_shift + self.get_position_in_observation('counter')]
             obs_rllib.append(counter)
         if self.observation_space_dict.get("previous_cppu", False):
-            previous_cppu = observation[self.get_position_in_observation('previous_cppu')]
-            assert isinstance(previous_cppu, str)
-            cppu_encoding = self.cppu_dictionary.get(previous_cppu)
-            obs_rllib.append(cppu_encoding)
+            starting_index = index_shift + self.get_position_in_observation('previous_cppu')
+            observation_size = 1 if self.prev_cppu_encoding == 1 else len(self.real_cppu_names)
+            index_shift += observation_size - 1
+            previous_cppu = observation[starting_index : starting_index + observation_size]
+            if self.prev_cppu_encoding == 0:
+                cppu_encoding_ohe = list(previous_cppu)
+                assert isinstance(cppu_encoding_ohe, list) 
+                obs_rllib.extend(cppu_encoding_ohe)
+            elif self.prev_cppu_encoding == 1:
+                cppu_encoding_categorical = self.real_cppu_names.index(previous_cppu[0])
+                assert isinstance(cppu_encoding_categorical, int)           
+                obs_rllib.append(cppu_encoding_categorical)
+        if self.observation_space_dict.get("least_hops", False):
+            starting_index = index_shift + self.get_position_in_observation('least_hops')
+            observation_size = 4 #self.direct_neighbours
+            index_shift += observation_size - 1
+            least_hops = list(observation[starting_index : starting_index + observation_size])
+            assert isinstance(least_hops, list)
+            obs_rllib.extend(least_hops)
+        if self.observation_space_dict.get("neighbours_products", False):
+            starting_index = index_shift + self.get_position_in_observation('neighbours_products')
+            observation_size = len(self.real_cppu_names)
+            index_shift += observation_size - 1
+            neighbours_products = list(observation[starting_index : starting_index + observation_size])
+            assert isinstance(neighbours_products, list)
+            obs_rllib.extend(neighbours_products)
+        if self.observation_space_dict.get("neighbours_skills", False):
+            starting_index = index_shift + self.get_position_in_observation('neighbours_skills')
+            observation_size = len(self.production_skills)*len(self.real_cppu_names)
+            index_shift += observation_size - 1
+            neighbours_skills = list(observation[starting_index : starting_index + observation_size])
+            assert isinstance(neighbours_skills, list)
+            obs_rllib.extend(neighbours_skills)
+            
         self.logger.info('RLlib Observation: {}'.format(obs_rllib))
+
+        #obs_complete_rllib = {"action_mask": np.array(action_mask), "observations": np.array(obs_rllib)}
+        #return obs_complete_rllib
+        
         return np.array(obs_rllib)
     
-    
-    def get_previous_cppu_name(self, product_info):
-        skill_history = product_info['States']['SkillHistory']
-        i = -1
-        while True:
-            if abs(i) > len(skill_history):
-                previous_cppu = self.cppu_name
-                break
-            last_entry = skill_history[i]
-            if last_entry.get("Cppu") == self.cppu_name:
-                i-=1
-            else:
-                previous_cppu = last_entry.get("Cppu")
-                break
-        self.logger.debug('Previous cppu was: {}'.format(previous_cppu))
+
+    def get_previous_cppu_name(self, product_number):
+        previous_cppu = self.trajectories[f"product_{product_number}"][-2] if len(self.trajectories[f"product_{product_number}"]) >= 2 else self.cppu_name
         return previous_cppu
     
 

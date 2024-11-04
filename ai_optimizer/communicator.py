@@ -44,6 +44,7 @@ class Communicator:
         self.mqtt_sub_client.subscribe(f'AgentReady/#')
         self.mqtt_sub_client.subscribe(f'StartedEpisode/#')
         self.mqtt_sub_client.subscribe(f'EndedEpisode/#')
+        self.mqtt_sub_client.subscribe(f'SkillExecution/#')
         self.mqtt_pub_client_lock = threading.Lock()
         self.mqtt_sub_client.loop_start()
         self.mqtt_pub_client.loop_start()
@@ -152,6 +153,14 @@ class Communicator:
     def add_cppus(self, payload, cppu_name):
         with self.cppu_ready_lock:
             self.cppu_ready.append(cppu_name)
+            
+    def publish_skill_execution(self, product, skill):
+        mqtt_topic = '/'.join(['SkillExecution',
+                               product,
+                               skill])
+        with self.mqtt_pub_client_lock:
+            self.mqtt_pub_client.publish(mqtt_topic,
+                                         json.dumps({"product": product}))
 
     def publish_episode_management(self, phase, episode_id,
                                    last_rewards=None,

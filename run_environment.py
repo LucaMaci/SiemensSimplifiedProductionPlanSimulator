@@ -10,7 +10,8 @@ from utils.graphs_utils import RewardVisualizer
 
 
 
-CONFIG_PATH = "ai_optimizer/configs/simulator_config_3units.json"
+#CONFIG_PATH = "ai_optimizer/configs/simulator_config_3units.json"
+CONFIG_PATH = "ai_optimizer/configs/simulator_config_siemens_20units_SAC.json"
 SEMI_MDP_CONFIG_PATH = "config/semiMDP_reward_config.json"
 LEARNING_CONFIG_PATH = "ai_optimizer/configs/learning_config.json"
 MQTT_HOST_URL = 'localhost'
@@ -44,6 +45,10 @@ checkpoint_frequency = config["checkpoint_frequency"]
 shaping_value = config["shaping_value"]
 agent_connections = config["agents_connections"]
 use_masking = learning_config["action_masking"]
+constant_positive_shaping_flag = learning_config["constant_positive_shaping_flag"]
+positive_shaping_constant = learning_config["positive_shaping_constant"]
+positive_shaping_coefficient = learning_config['positive_shaping_coefficient']
+time_shaping_coefficient = learning_config['time_shaping_coefficient']
 
 
 def get_rllib_state(state, old_state, one_hot_state=False, use_masking=False):
@@ -92,13 +97,15 @@ def extract_kpi(skill): # TODO remove since it is done inside the env
     return kpi
 
 
-def shape_reward(overall_kpi, production_kpi, shaping_value=1.):
+def shape_reward(overall_kpi, production_kpi, positive_shaping_coefficient, time_shaping_coefficient):
+
     """
     Shape the reward
-    - non_production_kpi: any kind of ,
-    - skills_duration: is the duration due to execution skills (it's contained in computed_duration)
+    - overall_ : referring to the entire history of the product. (e.g. "Duration"/"EnergyConsumption" since start of production)
+    - production_ : referring only to the self.production_skills part of the product's history (e.g. "Duration"/"EnergyConsumption" spent executing production skills)
+    - _kpi: actual value is a custom combination of the two KPI types "Duration" and "EnergyConsumption". Check combination used in self.extract_kpi().
     """
-    return overall_kpi - shaping_value * production_kpi
+    return positive_shaping_coefficient * production_kpi - time_shaping_coefficient * overall_kpi
 
 
 def compute_reward_rllib(reward, skill, non_production_skill):
@@ -187,8 +194,7 @@ for episode in range(n_episodes):
             #obs_rllib = []
             if cppu_name in previous_rewards:
                 overall_kpi, production_kpi = previous_rewards[cppu_name]
-                reshaped_reward = - shape_reward(overall_kpi=overall_kpi, production_kpi=production_kpi,
-                                                 shaping_value=shaping_value)
+                reshaped_reward = shape_reward(overall_kpi, production_kpi, positive_shaping_coefficient, time_shaping_coefficient)
             else:
                 reshaped_reward = None  # first time
             previous_rewards[cppu_name] = (0, 0) # reset accumulators
@@ -200,7 +206,7 @@ for episode in range(n_episodes):
             action = convert_action(raw_action, state["current_agent"])
         # Here send the message to the workers
         previous_state = state
-        state, reward, done, info = env.step(action)
+        state, reward, done, info, product = env.step(action)
         if action_selected_by_algorithm:
             for agent in cppu_names:
                 if agent in previous_rewards:
@@ -208,6 +214,7 @@ for episode in range(n_episodes):
                         production_kpi = 0
                         if info["production_skill_executed"]:
                             production_kpi = info["production_skill_duration"]
+                            communicator.publish_skill_execution(product, info['skill']) #luca
                         previous_rewards[agent] = (previous_rewards[agent][0] + overall_kpi,
                                                    previous_rewards[agent][1] + production_kpi)
         if done:
