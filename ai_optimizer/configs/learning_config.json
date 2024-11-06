@@ -14,7 +14,7 @@
     "number_workers": 0,
     "restore_checkpoint": 0,
     "use_baseline": 0,
-    "action_masking": true,
+    "action_masking": false,
     "action_masking_number" : 2,
     "update_interval": null,
     "framework": "tf",
