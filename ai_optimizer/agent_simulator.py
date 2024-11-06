@@ -718,11 +718,12 @@ class AgentSImulator():
             converted_states.update({product: []})
             step = 1
             while np.any(starting_state != 0):
-                for skill_index, order_list in enumerate(starting_state):
-                    if step in order_list:
+                for skill_index, order_triplet in enumerate(starting_state):
+                    if step in order_triplet:
+                        order_triplet = order_triplet.tolist()
                         converted_states[product].append(skill_index)
-                        index_in_order_list = order_list.index(step)
-                        order_list[index_in_order_list] = 0      
+                        index_in_order_list = order_triplet.index(step)
+                        starting_state[skill_index][index_in_order_list] = 0      
                 step += 1
                 if step > 300:
                     ValueError("Error in products_starting_state's format")
