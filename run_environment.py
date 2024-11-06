@@ -214,7 +214,7 @@ for episode in range(n_episodes):
                         production_kpi = 0
                         if info["production_skill_executed"]:
                             production_kpi = info["production_skill_duration"]
-                            communicator.publish_skill_execution(product, info['skill']) #luca
+                            communicator.publish_skill_execution(product, info['skill']) 
                         previous_rewards[agent] = (previous_rewards[agent][0] + overall_kpi,
                                                    previous_rewards[agent][1] + production_kpi)
         if done:

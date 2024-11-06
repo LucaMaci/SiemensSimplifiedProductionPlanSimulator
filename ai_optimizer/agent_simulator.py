@@ -89,7 +89,7 @@ class AgentSImulator():
         
         self.products_required_skills_initially = self.product_state_format_conversion(np.array(self.config["products_starting_state"]))
         self.product_names = [f'product_{i}' for i in range(self.config["n_products"])]
-        self.product_skills_already_executed = {product : [] for product in self.product_names} #LUCA - TODO: update via mqtt message every time a skill is performed on a product
+        self.product_skills_already_executed = {product : [] for product in self.product_names} 
         self.skill_names = [f'skill_{i}' for i in range(self.config["n_production_skills"])]
         #self.non_production_skills = self.learning_config['non_production_skills']
         
@@ -623,9 +623,9 @@ class AgentSImulator():
         """Update the dictionary self.full_neighbours_products, containing 
         the current number of products held by each cppu in the plant"""
         if from_cppu is not None and to_cppu is not None:
-            if self.full_neighbours_products(from_cppu) > 0: #So the very first cppu doesn't go to -1 after the first ever transport of a product
-                self.full_neighbours_products(from_cppu) -= 1
-            self.full_neighbours_products(to_cppu) += 1
+            if self.full_neighbours_products[from_cppu] > 0: #So the very first cppu doesn't go to -1 after the first ever transport of a product
+                self.full_neighbours_products[from_cppu] -= 1
+            self.full_neighbours_products[to_cppu] += 1
             self.trajectories[f"product_{product_number}"].append(to_cppu)
     
     
