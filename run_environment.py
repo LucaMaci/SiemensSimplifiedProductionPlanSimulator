@@ -55,13 +55,13 @@ def get_rllib_state(state, old_state, one_hot_state=False, use_masking=False):
     # next_skill , previous_agent, threshold_detected
     obs_rllib = []
     next_skill = [state["products_state"][0,:, 0].tolist().index(1)]
-    previous_agent = old_state["current_agent"]
+    previous_agent = [old_state["current_agent"]]
     if one_hot_state:
         next_skill_ohe = np.zeros(n_production_skills)
         next_skill_ohe[next_skill[0]] = 1
         next_skill = next_skill_ohe
         previous_agent_ohe = np.zeros(n_agents)
-        previous_agent_ohe[previous_agent] = 1
+        previous_agent_ohe[previous_agent[0]] = 1
         previous_agent = previous_agent_ohe
     obs_rllib.extend(next_skill)
     obs_rllib.extend(previous_agent)
