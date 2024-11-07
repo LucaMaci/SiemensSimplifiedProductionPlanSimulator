@@ -56,6 +56,10 @@ def get_rllib_state(state, old_state, one_hot_state=False, use_masking=False):
     obs_rllib = []
     next_skill = [state["products_state"][0,:, 0].tolist().index(1)]
     previous_agent = [old_state["current_agent"]]
+    
+    print(f"LUCA next_skill: {next_skill}")
+    print(f"LUCA previous_agent: {previous_agent}")
+    
     if one_hot_state:
         next_skill_ohe = np.zeros(n_production_skills)
         next_skill_ohe[next_skill[0]] = 1
@@ -66,12 +70,16 @@ def get_rllib_state(state, old_state, one_hot_state=False, use_masking=False):
     obs_rllib.extend(next_skill)
     obs_rllib.extend(previous_agent)
     obs_rllib = np.array(obs_rllib).flatten().tolist()
+    
     if use_masking:
         action_mask = get_action_mask(state)
         obs_rllib = {
             "observations": obs_rllib,
             "action_mask": action_mask.tolist()
         }
+        
+    print(f"LUCA obs_rllib: {obs_rllib}")
+
     return obs_rllib
 
 def get_action_mask(state):

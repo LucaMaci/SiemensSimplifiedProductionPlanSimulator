@@ -19,7 +19,7 @@
     "custom_reward": "reward5",
     "alpha": 1,
     "beta": 0,
-    "one_hot_state": false,
+    "one_hot_state": true,
     "agents_connections": {"0": [null, 1, 5, null],
                            "1": [null, 2, 6, 0],
                            "2": [null, 3, null, 1],
