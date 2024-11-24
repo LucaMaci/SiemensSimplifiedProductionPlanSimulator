@@ -387,6 +387,9 @@ class AgentSImulator():
         return space
 
     def prepare_observation(self, state):
+        
+        print(f"LUCA - State in Prepare_Observation: {state}")
+        
         if self.use_masking:
             obs = dict(state)
         else:
