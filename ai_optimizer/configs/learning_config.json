@@ -20,7 +20,7 @@
     "framework": "tf",
     "loop_threshold": 100,
     "shaping_value": 3.0,
-    "use_masking": true,
+    "use_masking": false,
     "checkpoint_frequency": 300,
     "baseline": "random",
     "fact_duration": 1.0,

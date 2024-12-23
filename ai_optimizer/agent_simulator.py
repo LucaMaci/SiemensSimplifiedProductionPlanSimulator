@@ -388,7 +388,6 @@ class AgentSImulator():
 
     def prepare_observation(self, state):
         
-        print(f"LUCA - State in Prepare_Observation: {state}")
         self.logger.info(f"LUCA - State in Prepare_Observation: {state}")
         
         if self.use_masking:
